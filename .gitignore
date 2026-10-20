@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+# Local env files
+.env
+# Machine learning models
+models/*.joblib
+# Data files
+data/
+# Log files
+logs/
+# OS generated files
+.DS_Store
+# Python bytecode
+*.py[cod]
+# pytest cache
+.pytest_cache/
+# Jupyter Notebook checkpoints
+data/
+
+models/

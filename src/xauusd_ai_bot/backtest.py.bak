@@ -1,0 +1,276 @@
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DATA_FILE = ROOT / "data/processed/xauusd_features.csv"
+MODEL_FILE = ROOT / "models/xauusd_direction_model.joblib"
+TRADE_FILE = ROOT / "data/processed/backtest_trades.csv"
+EQUITY_FILE = ROOT / "data/processed/backtest_equity.csv"
+
+HORIZON = 4
+THRESHOLD = 0.55
+
+# Provisional assumptions, in XAUUSD price units.
+SPREAD_PRICE = 0.35
+SLIPPAGE_PRICE_PER_SIDE = 0.05
+
+# Unknown broker commission: zero is a placeholder, not a verified value.
+COMMISSION_RATE_PER_SIDE = 0.0
+
+INITIAL_EQUITY = 10_000.0
+RISK_PER_TRADE = 0.0025
+MAX_DAILY_LOSS = 0.01
+STOP_ATR_MULTIPLE = 1.5
+
+# Research-only constraint. Not a broker margin calculation.
+MAX_NOTIONAL_MULTIPLE = 1.0
+
+
+def max_drawdown(equity: pd.Series) -> float:
+    if equity.empty:
+        return 0.0
+    peaks = equity.cummax()
+    return float((equity / peaks - 1.0).min())
+
+
+def main():
+    if not DATA_FILE.exists() or not MODEL_FILE.exists():
+        raise FileNotFoundError("Missing features or saved model.")
+
+    df = pd.read_csv(DATA_FILE)
+    required = {
+        "time", "open", "high", "low", "close", "atr_14_ratio"
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time").reset_index(drop=True)
+
+    if df[list(required - {"time"})].isna().any().any():
+        raise ValueError("NaN values found in required price/ATR columns.")
+
+    artifact = joblib.load(MODEL_FILE)
+    model = artifact["model"]
+    features = artifact["features"]
+
+    if not set(features).issubset(df.columns):
+        raise ValueError("Model features are missing from the feature dataset.")
+
+    # Held-out period. Purging the boundary is still needed for rigorous
+    # validation because the target horizon overlaps chronological splits.
+    start = int(len(df) * 0.80)
+    test = df.iloc[start:].copy().reset_index(drop=True)
+
+    if len(test) <= HORIZON + 1:
+        raise ValueError("Not enough test candles.")
+
+    test["prob_up"] = model.predict_proba(test[features])[:, 1]
+    test["signal"] = np.select(
+        [
+            test["prob_up"] >= THRESHOLD,
+            test["prob_up"] <= 1 - THRESHOLD,
+        ],
+        [1, -1],
+        default=0,
+    )
+
+    equity = INITIAL_EQUITY
+    peak_equity = INITIAL_EQUITY
+    current_day = None
+    daily_start_equity = INITIAL_EQUITY
+    blocked_day = False
+    next_entry_index = 0
+
+    trades = []
+    equity_points = [{
+        "time": test.loc[0, "time"],
+        "equity": equity,
+        "peak_equity": peak_equity,
+        "drawdown": 0.0,
+    }]
+
+    for i in range(len(test) - HORIZON):
+        signal_time = test.loc[i, "time"]
+        day = signal_time.date()
+
+        if day != current_day:
+            current_day = day
+            daily_start_equity = equity
+            blocked_day = False
+
+        if blocked_day or i < next_entry_index:
+            continue
+
+        direction = int(test.loc[i, "signal"])
+        if direction == 0:
+            continue
+
+        entry_index = i + 1
+        planned_exit_index = i + HORIZON
+        entry_bar = test.loc[entry_index]
+
+        entry_open = float(entry_bar["open"])
+        atr = float(test.loc[i, "atr_14_ratio"] * test.loc[i, "close"])
+
+        if not np.isfinite(atr) or atr <= 0 or entry_open <= 0:
+            continue
+
+        stop_distance = STOP_ATR_MULTIPLE * atr
+
+        # Assumption: exported OHLC prices are BID-side.
+        # Long: buy at ask; sell at bid.
+        # Short: sell at bid; buy back at ask.
+        if direction == 1:
+            entry_price = (
+                entry_open + SPREAD_PRICE + SLIPPAGE_PRICE_PER_SIDE
+            )
+            stop_price = entry_price - stop_distance
+        else:
+            entry_price = entry_open - SLIPPAGE_PRICE_PER_SIDE
+            stop_price = entry_price + stop_distance
+
+        if entry_price <= 0:
+            continue
+
+        # Size by target stop risk, expressed as a fraction of equity.
+        # This is a notional-exposure proxy, NOT actual lots or broker cash P/L.
+        stop_fraction = stop_distance / entry_price
+        exposure_fraction = RISK_PER_TRADE / stop_fraction
+
+        # Do not silently cap the exposure and distort the risk target.
+        # Skip if the required notional exceeds the configured 1x limit.
+        if (
+            not np.isfinite(exposure_fraction)
+            or exposure_fraction <= 0
+            or exposure_fraction > MAX_NOTIONAL_MULTIPLE
+        ):
+            continue
+
+        stopped = False
+        exit_index = planned_exit_index
+        exit_bar = test.loc[planned_exit_index]
+
+        if direction == 1:
+            exit_price = float(exit_bar["close"]) - SLIPPAGE_PRICE_PER_SIDE
+        else:
+            exit_price = (
+                float(exit_bar["close"])
+                + SPREAD_PRICE
+                + SLIPPAGE_PRICE_PER_SIDE
+            )
+
+        # Scan bars from entry through planned exit. If the stop is touched,
+        # record that bar's timestamp. OHLC cannot reveal intrabar ordering.
+        for j in range(entry_index, planned_exit_index + 1):
+            bar = test.loc[j]
+
+            if direction == 1 and float(bar["low"]) <= stop_price:
+                exit_index = j
+                exit_bar = bar
+                exit_price = stop_price - SLIPPAGE_PRICE_PER_SIDE
+                stopped = True
+                break
+
+            # For shorts, high is assumed BID-side; approximate ask high.
+            ask_high = float(bar["high"]) + SPREAD_PRICE
+            if direction == -1 and ask_high >= stop_price:
+                exit_index = j
+                exit_bar = bar
+                exit_price = stop_price + SLIPPAGE_PRICE_PER_SIDE
+                stopped = True
+                break
+
+        if direction == 1:
+            gross_price_pnl = exit_price - entry_price
+        else:
+            gross_price_pnl = entry_price - exit_price
+
+        gross_return = gross_price_pnl / entry_price
+        commission_return = 2.0 * COMMISSION_RATE_PER_SIDE
+        net_return = gross_return - commission_return
+
+        # Equity return under the notional exposure proxy.
+        equity_return = exposure_fraction * net_return
+        trade_pnl_proxy = equity * equity_return
+        equity_before = equity
+        equity *= 1.0 + equity_return
+
+        peak_equity = max(peak_equity, equity)
+        drawdown = equity / peak_equity - 1.0
+
+        trades.append({
+            "signal_time": signal_time,
+            "entry_time": entry_bar["time"],
+            "exit_time": exit_bar["time"],
+            "direction": direction,
+            "prob_up": float(test.loc[i, "prob_up"]),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "stop_price": stop_price,
+            "stopped": stopped,
+            "exit_reason": "stop" if stopped else "time",
+            "gross_price_return": gross_return,
+            "commission_return_assumption": commission_return,
+            "net_return_proxy": net_return,
+            "exposure_fraction": exposure_fraction,
+            "target_risk_fraction": RISK_PER_TRADE,
+            "equity_before": equity_before,
+            "trade_pnl_proxy": trade_pnl_proxy,
+            "equity": equity,
+            "drawdown_at_exit": drawdown,
+        })
+
+        equity_points.append({
+            "time": exit_bar["time"],
+            "equity": equity,
+            "peak_equity": peak_equity,
+            "drawdown": drawdown,
+        })
+
+        # Never overlap trades. This research backtest does not model
+        # simultaneous positions or intrabar account liquidation.
+        next_entry_index = exit_index + 1
+
+        if equity <= daily_start_equity * (1.0 - MAX_DAILY_LOSS):
+            blocked_day = True
+
+    trades_df = pd.DataFrame(trades)
+    equity_df = pd.DataFrame(equity_points)
+
+    TRADE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    trades_df.to_csv(TRADE_FILE, index=False)
+    equity_df.to_csv(EQUITY_FILE, index=False)
+
+    print("\n--- XAUUSD Research Backtest ---")
+    print(f"Test candles: {len(test):,}")
+    print(f"Trades taken: {len(trades_df):,}")
+    print(f"Spread assumption: {SPREAD_PRICE:.3f} price units")
+    print(f"Slippage per side: {SLIPPAGE_PRICE_PER_SIDE:.3f} price units")
+    print(f"Commission per side: {COMMISSION_RATE_PER_SIDE:.5%}")
+    print(f"Maximum notional exposure: {MAX_NOTIONAL_MULTIPLE:.1f}x")
+    print("Sizing: notional proxy; actual broker lots are NOT calculated.")
+
+    if trades_df.empty:
+        print("No trades passed the filters.")
+    else:
+        r = trades_df["net_return_proxy"]
+        print(f"Win rate: {(r > 0).mean():.2%}")
+        print(f"Mean net price return/trade: {r.mean():.5%}")
+        print(f"Final equity proxy: {equity:.2f}")
+        print(f"Max drawdown at trade exits: {max_drawdown(equity_df['equity']):.2%}")
+        print(f"Stop exits: {int(trades_df['stopped'].sum())}")
+        print(f"Mean exposure fraction: {trades_df['exposure_fraction'].mean():.3f}")
+
+    print(f"Trades saved: {TRADE_FILE}")
+    print(f"Equity saved: {EQUITY_FILE}")
+    print("Research only. No MT5 orders were placed.")
+
+
+if __name__ == "__main__":
+    main()
